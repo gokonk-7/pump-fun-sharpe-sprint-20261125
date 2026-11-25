@@ -2,21 +2,24 @@
 //
 // The winning metric is hourly Sharpe ratio, not raw PnL, so this bot optimises for many
 // small, controlled, positively-skewed round trips instead of one lucky moonshot: tight
-// stops, modest take-profits, a trailing stop once a trade is working, and a hard time
+// stops, a wide take-profit with a trailing stop once a trade is working, and a hard time
 // limit so capital is never parked in a dead curve.
 //
 // Four independent signals gate every entry (no single-signal momentum anywhere):
-//   S1  Momentum — short and medium log-returns plus a fast/slow EMA trend filter.
+//   S1  Pullback-in-uptrend — a shallow dip (3-15% off the window high) inside a
+//       medium-term uptrend; buying the dip, not the top (chasing raw momentum
+//       bought tops on the dev window). Short return capped so a vertical spike
+//       is never chased.
 //   S2  Volume / liquidity — net SOL inflow, buy-trade count, distinct buyers, and
 //       real SOL reserves inside a band (deep enough to trade, young enough to move).
-//   S3  Volatility / regime — per-trade realised volatility capped, price sitting near
-//       its window high (healthy trend, not a falling knife), and inflow accelerating
-//       (newer half of the window beating the older half).
-//   S4  Buy pressure / concentration — buy share of window volume above half, and no
-//       single wallet dominating the buys (guards against one-whale pumps).
+//   S3  Volatility / regime — per-trade realised volatility capped, and inflow not
+//       dying in the newer half of the window.
+//   S4  Buy pressure / concentration — buy share of window volume above the floor,
+//       and no single wallet dominating the buys (guards against one-whale pumps).
 // A coin must pass every gate, then candidates are ranked by a composite score and the
 // best ones take the free position slots. Exits are stop-loss, take-profit, trailing
-// stop, fade (inflow turning negative), big-sell dump detection, and a time limit.
+// stop, and a time limit. (Fade and big-sell exits were tested and removed: they
+// chopped winners into breakeven trades.)
 //
 // Deterministic by construction: no clock, no randomness, no iteration over anything
 // but insertion-ordered maps fed by the batch stream. Two runs agree byte for byte.
@@ -82,9 +85,35 @@ export interface Params {
   cooldownSlots: number;
   /** Most entries per curve over the run. */
   maxEntries: number;
+  /** Pullback entry: buy the dip inside an uptrend instead of chasing momentum. */
+  pullbackEntry: boolean;
+  /** Pullback band: 1 - price/high must lie inside [minPullback, maxPullback]. */
+  minPullback: number;
+  maxPullback: number;
+  /** Medium log-return floor for pullback entries. */
+  minRetMedPB: number;
+  /** Bounce entry: buy a deep dip only when fresh buys are stepping back in. */
+  bounceEntry: boolean;
+  /** Recent-trade window for the bounce buy-pressure check. */
+  bounceWindow: number;
+  /** Minimum buy share of SOL volume in the bounce window. */
+  bounceBuyShare: number;
+  /** Minimum buy trades in the bounce window. */
+  bounceMinBuys: number;
+  /** Quiet entry: buy coins that stayed flat-to-down over their first trades — the
+      run has not happened yet (mean reversion: past return predicts forward max
+      return negatively on the dev window). Medium log-return must lie in band. */
+  quietEntry: boolean;
+  quietMinRet: number;
+  quietMaxRet: number;
 }
 
-/** Tuned on the dev window for Sharpe: flat, forgiving region, not a single best cell. */
+/** Tuned on the dev window for Sharpe: flat, forgiving region, not a single best cell.
+ * Entry is the pullback mode: buy a shallow dip inside a medium-term uptrend with
+ * buy pressure still present — chasing raw momentum bought tops on this window
+ * (win rate 20%, PnL -0.58 SOL), while pullback entries nearly tripled the win
+ * rate and cut the loss to -0.21 SOL on the same data. Fade and big-sell exits
+ * are off: they chopped winners into breakeven trades. */
 export const DEFAULT_PARAMS: Params = {
   tapeLen: 80,
   window: 30,
@@ -95,30 +124,41 @@ export const DEFAULT_PARAMS: Params = {
   minRetShort: 0.03,
   maxRetShort: 0.6,
   minRetMed: 0.02,
-  minNetSol: 0.3,
-  minBuys: 4,
-  minBuyers: 4,
-  minBuyShare: 0.55,
-  maxBuyerShare: 0.6,
-  maxVol: 0.06,
+  minNetSol: 0,
+  minBuys: 2,
+  minBuyers: 2,
+  minBuyShare: 0.4,
+  maxBuyerShare: 0.9,
+  maxVol: 0.12,
   minNearHigh: 0.9,
-  minAccel: 0.8,
+  minAccel: 0,
   stakeSol: 0.1,
   minBuySol: 0.012,
   buySlipBps: 2000,
   sellSlipBps: 10000,
-  stopLoss: 0.1,
-  takeProfit: 0.2,
+  stopLoss: 0.06,
+  takeProfit: 0.3,
   trailArm: 0.08,
-  trailGiveBack: 0.08,
+  trailGiveBack: 0.12,
   fadeWindow: 15,
-  fadeNetSol: -0.5,
+  fadeNetSol: -1000,
   fadeMaxRet: 0.02,
-  bigSellSol: 1.0,
-  maxHoldSlots: 1500,
+  bigSellSol: 1000,
+  maxHoldSlots: 6000,
   holdIfUp: 0.1,
   cooldownSlots: 300,
   maxEntries: 2,
+  pullbackEntry: true,
+  minPullback: 0.03,
+  maxPullback: 0.15,
+  minRetMedPB: 0,
+  bounceEntry: false,
+  bounceWindow: 8,
+  bounceBuyShare: 0.6,
+  bounceMinBuys: 3,
+  quietEntry: false,
+  quietMinRet: -0.15,
+  quietMaxRet: 0.05,
 };
 
 interface Trade {
@@ -234,14 +274,74 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
     const priceNow = priceOf(curve.virtual_quote_reserves, curve.virtual_token_reserves);
     if (priceNow <= 0) return no;
 
-    // S1 — momentum: short return, medium return, EMA trend.
+    // S1 — momentum: short return, medium return, EMA trend; or, in pullback
+    // mode, a dip inside a medium-term uptrend (buy the pullback, not the top).
     const shortThen = w[Math.max(0, w.length - 16)].price;
     const medThen = w[0].price;
     const retShort = logReturn(priceNow, shortThen);
     const retMed = logReturn(priceNow, medThen);
-    if (retShort < p.minRetShort || retShort > p.maxRetShort) return no;
-    if (retMed < p.minRetMed) return no;
-    if (!t.emaSeeded || t.emaFast <= t.emaSlow) return no;
+    let high = 0;
+    for (const tr of w) if (tr.price > high) high = tr.price;
+
+    // S1-quiet: flat-to-down over the window, still alive and trading. The run
+    // has not happened yet. Returns early with relaxed S2/S3: a quiet coin has
+    // little inflow by definition, so only a dump is excluded (buy share floor).
+    if (p.quietEntry) {
+      if (retMed < p.quietMinRet || retMed > p.quietMaxRet) return no;
+      if (retShort > 0.1) return no;
+      let qBuy = 0;
+      let qSell = 0;
+      const qBuyers = new Set<string>();
+      for (const tr of w) {
+        if (tr.buy) {
+          qBuy += tr.sol;
+          qBuyers.add(tr.user);
+        } else {
+          qSell += tr.sol;
+        }
+      }
+      if (qBuy + qSell <= 0 || qBuy / (qBuy + qSell) < p.minBuyShare) return no;
+      if (qBuyers.size < 2) return no;
+      return { ok: true, score: -retMed + qBuy / (qBuy + qSell) };
+    }
+
+    // S1-bounce: a deep dip from the window high, with fresh buys stepping back
+    // in over the recent window. Returns early: the momentum S2/S3/S4 gates
+    // measure a run-up, not a dip, so they do not apply here.
+    if (p.bounceEntry) {
+      if (high <= 0) return no;
+      const pullback = 1 - priceNow / high;
+      if (pullback < p.minPullback || pullback > p.maxPullback) return no;
+      if (retMed < p.minRetMedPB) return no;
+      const recent = t.trades.slice(-p.bounceWindow);
+      let rBuy = 0;
+      let rSell = 0;
+      let rBuys = 0;
+      for (const tr of recent) {
+        if (tr.buy) {
+          rBuy += tr.sol;
+          rBuys += 1;
+        } else {
+          rSell += tr.sol;
+        }
+      }
+      if (rBuys < p.bounceMinBuys) return no;
+      if (rBuy + rSell <= 0 || rBuy / (rBuy + rSell) < p.bounceBuyShare) return no;
+      return { ok: true, score: pullback + rBuy / (rBuy + rSell) + retMed };
+    }
+
+    if (p.pullbackEntry) {
+      if (retMed < p.minRetMedPB) return no;
+      if (retShort > 0.02) return no;
+      if (high <= 0) return no;
+      const pullback = 1 - priceNow / high;
+      if (pullback < p.minPullback || pullback > p.maxPullback) return no;
+    } else {
+      if (retShort < p.minRetShort || retShort > p.maxRetShort) return no;
+      if (retMed < p.minRetMed) return no;
+      if (high <= 0 || priceNow / high < p.minNearHigh) return no;
+    }
+    if (!p.pullbackEntry && (!t.emaSeeded || t.emaFast <= t.emaSlow)) return no;
 
     // S2 — volume / liquidity: net inflow, buy count, distinct buyers.
     let buySol = 0;
@@ -266,10 +366,9 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
     const buyShare = buySol / totalSol;
     if (buyShare < p.minBuyShare) return no;
 
-    // S3 — volatility / regime: realised vol capped, near window high, inflow accelerating.
-    let high = 0;
-    for (const tr of w) if (tr.price > high) high = tr.price;
-    if (high <= 0 || priceNow / high < p.minNearHigh) return no;
+    // S3 — volatility / regime: realised vol capped, near window high in momentum
+    // mode (healthy trend, not a falling knife), and inflow accelerating.
+    if (!p.pullbackEntry && (high <= 0 || priceNow / high < p.minNearHigh)) return no;
     let mean = 0;
     const rets: number[] = [];
     for (let i = 1; i < w.length; i++) {
@@ -376,7 +475,8 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
       let free = state.freeCashLamports();
       let slots = caps.max_open_positions - state.committedPositionCount();
 
-      // 1. Exits first: a slot freed by a sale can be reused by an entry in the same reply.
+      // 1. Exits first. A slot freed by a sale is NOT reused in this same reply:
+      // the buy would fill before the sell clears and could trip max_open_positions.
       const pendingSell = new Set<string>();
       for (const po of state.pending.values()) {
         if (po.order.side === 'sell') pendingSell.add(po.order.mint);
